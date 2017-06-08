@@ -1,0 +1,368 @@
+"""
+<Program Name>
+  tcp_relay.r2py
+
+<Purpose>
+  The purpose of this program is to act as a nat forwarder.
+  Messages from nodeA to nodeB could be forwarded through
+  this forwarder.
+  
+<Usage>
+  python repy.py RESTRICTION_FILE dylink.repy tcp_relay.repy TCP_PORT 
+    [ NAT_FORWARDER_KEY ]
+"""
+
+session = dy_import_module("session.r2py")
+advertisepipe = dy_import_module("advertisepipe.r2py")
+affix_stack = dy_import_module("affix_stack.r2py")
+dy_import_module_symbols("tcp_relay_common_lib.r2py")
+canilisten = dy_import_module("canilisten.r2py")
+time = dy_import_module("time.r2py")
+
+SLEEP_TIME = 0.001
+MAX_BUFFER_LEN = 1400
+
+buffer = 4   # main and advertise thread, and two spares
+available_threads = getresources()[0]['events'] - buffer
+MAX_CLIENTS_PER_SERVER = 5
+MAX_SERVERS = max(1, int(available_threads/MAX_CLIENTS_PER_SERVER))
+
+INFO_MSG = 1
+ERR_MSG = 2
+DEBUG_MSG = 3
+
+registered_server = {}
+register_lock = createlock()
+
+
+def logmsg(message, msg_type):
+
+  header = "[%.4f] " % time.time_getunixtime()
+
+  if msg_type == INFO_MSG:
+    header += "INFO: "
+  elif msg_type == ERR_MSG:
+    header += "ERROR: "
+  elif msg_type == DEBUG_MSG:
+    header += "DEBUG: "
+
+  log(header + message + '\n')
+
+
+  
+  
+# ====================================================
+# TCP NAT Forwarder - Common Entry Point.
+# ====================================================
+def tcp_forwarder_listener():
+
+  # Create a TCP server socket.
+  tcp_forwarder_sock = listenforconnection(getmyip(), 
+    mycontext['listenport_tcp'])
+  
+  logmsg("Started TCP NAT Forwarder listener on '%s' port '%d'" % 
+         (getmyip(), mycontext['listenport_tcp']), INFO_MSG)
+         
+         
+while True:
+    
+    try:
+      # Try to see if there is any connection waiting.
+      remote_ip, remote_port, sockobj = tcp_forwarder_sock.getconnection() # XXX Use a timeout socket instead to avoid malicious clients/servers blocking sockets forever
+      logmsg("Incoming connection from '%s:%d'" % (remote_ip, remote_port), 
+        INFO_MSG)
+    except SocketWouldBlockError:
+      sleep(SLEEP_TIME)
+    except Exception, err:
+      logmsg("Error in getconnection: " + str(err), ERR_MSG)
+    else:
+      logmsg("Got connection from " + str(remote_ip) + ":" + str(remote_port), INFO_MSG)
+      try:
+        conn_init_message = session.session_recvmessage(sockobj)
+        logmsg(str(remote_ip) + ":" + str(remote_port) + " said " + 
+          conn_init_message, DEBUG_MSG)
+        (conn_type, conn_id) = conn_init_message.split(',')
+      except Exception, err: # XXX Likely too broad an except
+        logmsg("Error in connection establishment with " + str(remote_ip) + 
+          ":" + str(remote_port) + ": " + 
+          str(type(err)) + " " + str(err), DEBUG_MSG)
+        sockobj.close()
+        continue
+        
+        
+        if conn_type == SERVER_REGISTER:
+        # This is the case where a new server wants to register to this
+        # NAT Forwarder.
+          createthread(register_new_server(remote_ip, remote_port, conn_id, sockobj))
+          logmsg("Registered server " + remote_ip + ":" + str(remote_port), DEBUG_MSG)
+          
+
+def register_new_server(remote_ip, remote_port, server_id, sockobj):
+
+  def _register_server_helper():
+    """
+    <Purpose>
+      Register a new server with the forwarder. If we are here
+      then a server node has called openconnection to the NAT
+      forwarder for the first time in order to open up a connection
+      such that the NAT forwarder can make future connections.
+      
+    <Arguments>
+      remote_ip - The ip address of the node that made the initial connection.
+      remote_port - The port number of the node that made the initial connection.
+      sockobj - The socket that will be used for communication.
+     
+    <Exception>
+      None.
+	 
+    <Side Effects>
+      None.
+	   
+      <Return>
+      None.
+    """
+    
+    logmsg("Server '%s' at %s:%s requesting to register" % 
+      (server_id, remote_ip, str(remote_port)), INFO_MSG)
+
+    # Ensure that the registered_server dict doesn't change while 
+    # we are modifying it    
+    register_lock.acquire(True)
+
+    # Check to see if the server is already registered. If it is then 
+    # we just return.
+    
+    if server_id in registered_server.keys():
+      # Make sure that it is in the proper format.
+      if 'connected_clients' not in registered_server[server_id].keys():
+        registered_server[server_id]['connected_clients'] = []
+      if 'waiting_clients' not in registered_server[server_id].keys():
+        registered_server[server_id]['waiting_clients'] = []
+      if 'client_lock' not in registered_server[server_id].keys():
+        registered_server[server_id]['client_lock'] = createlock()
+      # The server entry is in the correct format.
+      register_lock.release()
+      return
+      
+      # The server was not in the dict already. Add it, start 
+    # serving threads, etc. 
+    try:
+      if len(registered_server.keys()) < MAX_SERVERS:
+        # The server_id does not exist in our registered_server dict.
+        registered_server[server_id] = {}
+        registered_server[server_id]['connected_clients'] = []
+        registered_server[server_id]['waiting_clients'] = []
+        registered_server[server_id]['client_lock'] = createlock()
+        # All changes done. Release the lock.
+        register_lock.release()
+        
+        # Launch a thread that waits for any communication from the server.
+        # Such that if a server checks to see if there is any client waiting,
+        # it responds.
+        createthread(launch_server_communication_thread(sockobj, server_id))
+        
+        try:
+          session.session_sendmessage(sockobj, CONNECT_SUCCESS)
+        except SocketClosedRemote, err:
+          logmsg("Socket closed while registering server. " + repr(err), DEBUG_MSG)
+          unregister_server(server_id)
+          
+          
+          logmsg("Registered server '%s' at %s:%s successfully. %i server slots remain." % 
+          (server_id, remote_ip, str(remote_port), 
+          MAX_SERVERS - len(registered_server)), INFO_MSG)
+      else:
+        try:
+          session.session_sendmessage(sockobj, CONNECT_FAIL)
+        except SocketClosedRemote:
+          # Too bad, now they won't receive the error message. Ignore!
+          pass
+        logmsg("Unable to register server '%s' on %s:%s. Max servers reached." %
+          (server_id, remote_ip, str(remote_port)), INFO_MSG)
+    except Exception, e:
+      logmsg("Error " + repr(e), INFO_MSG)
+
+
+  return _register_server_helper
+  
+  
+
+# ====================================================
+# TCP Server Control Socket
+# ====================================================
+
+def launch_server_communication_thread(sockobj, server_id):
+  
+  def _server_communication_helper():
+    """
+    <Purpose>
+      This thread is launched after a server has registered with
+      the nat forwarder. This thread will keep running until the
+      control socket for the server has been closed. It is used
+      for communicating with the server. The server may ping from
+      time to time to check if there are any clients waiting for
+      it. If there are then the server will create a connection
+      with the Nat Forwarder.
+      
+    <Arguments>
+      sockobj - The socket object that is used for communication.
+      server_id - The id of the server
+    
+    <Side Effects>
+      None
+      
+    <Exceptions>
+      None
+      
+    <Return>
+      None
+    """
+    
+    # Keep this thread alive as long as the socket object is open.
+    # We break out of the loop if there is any socket closed exceptions
+    # or any unexpected errors that arise.
+    
+    
+    
+    allowed_tcp_ports = list(getresources()[0]["connport"])
+    random.random_shuffle(allowed_tcp_ports)
+    
+    
+    
+    for server_port in allowed_tcp_ports:
+      try:
+        server_socket = listenforconnection(getmyip(), server_port)
+        break
+      except Exception, e:
+        logtn("Error in listenforconnection on", getmyip(), "port", 
+            server_port, repr(e))
+        sleep(1)
+    else:
+      logtn("Could not find a port I can listen on. Exiting.")
+      exitall()
+    
+    
+    
+    try:
+      session.session_sendmessage(sockobj, server_port)
+    except SocketClosedRemote, err:
+      logmsg("Socket closed. " + repr(err), DEBUG_MSG)
+      unregister_server(server_id)
+      # Check if the server is requesting to see if there is any
+      # clients waiting to be connected.
+    
+    
+    while True:  
+      try:
+        request_type = session.session_recvmessage(sockobj)
+        # Check if the server is requesting to see if there is any
+        # clients waiting to be connected.
+        if request_type == CHECK_SERVER_CONN:
+          if len(registered_server[server_id]['waiting_clients']) > 0:
+            session.session_sendmessage(sockobj, CLIENT_AVAILABLE)
+          else:
+            session.session_sendmessage(sockobj, CLIENT_UNAVAILABLE)
+      
+      
+        mycontext['listenserverport']= server_port
+        tcp_server_sock = listenforconnection(getmyip(),mycontext['listenserverport'])
+          
+        logmsg("Started TCP Server listener on '%s' port '%d'" % 
+        (getmyip(), mycontext['listenserverport']), INFO_MSG)
+        
+          
+        while True:
+          try:
+      	    # Try to see if there is any connection waiting.
+      	    client_ip, client_port, clientsockobj = tcp_server_sock.getconnection() # XXX Use a timeout socket instead to avoid malicious clients/servers blocking sockets forever
+      	    logmsg("Incoming connection from '%s:%d'" % (client_ip, client_port), 
+        	  INFO_MSG)
+	  except SocketWouldBlockError:
+      	      sleep(SLEEP_TIME)
+   	  except Exception, err:
+      	      logmsg("Error in getconnection: " + str(err), ERR_MSG)
+    	  else:
+      	    logmsg("Got connection from " + str(client_ip) + ":" + str(client_port), INFO_MSG)
+            try:
+              conn_init_message_client = session.session_recvmessage(clientsockobj)
+              logmsg(str(client_ip) + ":" + str(client_port) + " said " + 
+              conn_init_message, DEBUG_MSG)
+              (conn_type_client, conn_id_client) = conn_init_message_client.split(',')
+	    except Exception, err: # XXX Likely too broad an except
+              logmsg("Error in connection establishment with " + str(client_ip) + 
+              ":" + str(client_port) + ": " + 
+              str(type(err)) + " " + str(err), DEBUG_MSG)
+              clientsockobj.close()
+              continue
+          
+          
+      except (SocketClosedRemote, SocketClosedLocal, session.SessionEOF), err:
+        break
+      except Exception, err:
+        logmsg("Unexpected error in launch_server_communication_thread: " + 
+          str(type(err)) + " " + str(err), ERR_MSG)
+        break
+
+    sockobj.close()
+
+    # Once we have broken out of the loop, unregister the server 
+    # before we exit this thread.
+    unregister_server(server_id)
+      
+  
+  return _server_communication_helper
+  
+  
+  
+  # ====================================================
+# Program Entry
+# ====================================================
+if callfunc == 'initialize':
+  log("Getting an NTP timestamp...\n")
+  # Try all UDP ports; ignore TCP time servers.
+  for local_port in list(getresources()[0]["messport"]):
+    try:
+      time.time_updatetime(local_port)
+      break
+    except:
+      continue
+  else:
+    log("Could not updatetime() on any of the allowed UDP ports. Continuing with time.time_getunixtime = getruntime.\n")
+    time.time_getunixtime = getruntime
+
+
+  logmsg("Starting TCP relay.", INFO_MSG)
+  logmsg("MAX_SERVERS: " + str(MAX_SERVERS) +
+    ", MAX_CLIENTS_PER_SERVER: " + str(MAX_CLIENTS_PER_SERVER), INFO_MSG)
+
+
+  if len(callargs) < 1:
+    log("Usage:\n\tpython repy.py restrictionsfile dylink.r2py tcp_relay.r2py TCP_PORT [FORWARDER_KEY]\n") # XXX Allow for port autoconfiguration!
+    exitall()
+
+  mycontext['listenport_tcp'] = int(callargs[0])
+
+  if len(callargs) >= 2:
+    # Override tcp_relay_common_lib's key
+    NAT_FORWARDER_KEY = callargs[1]
+    
+    myip, myport = getmyip(), mycontext['listenport_tcp']
+
+  (i_can_listen, ignore, ignore) = canilisten.check_specific_port(myport)
+
+  if not i_can_listen:
+    logmsg(
+"""NOTE WELL: It seems that your node is not able to receive incoming 
+connections from the public Internet. This probably leaves the TCP relay 
+uncontactable unless you set up port forwarding etc. on your gateway. 
+I'll let you proceed regardless. You hopefully know what you do.""", ERR_MSG)
+
+# Launch the TCP Forwarder.
+  logmsg("Creating forwarder thread on " + myip + ":" + str(myport), INFO_MSG)
+  createthread(tcp_forwarder_listener)
+  # XXX Create a status thread to show the contents of the registered_server dict every ten minutes or so.
+  # Launch advertiser and advertise this forwarders ip address, tcp port.
+  advertise_value = myip + ':' + str(myport)
+  logmsg("Starting advertise thread for " + NAT_FORWARDER_KEY + 
+    ": " + advertise_value, INFO_MSG)
+  advertisepipe.add_to_pipe(NAT_FORWARDER_KEY, advertise_value)
